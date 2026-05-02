@@ -1,0 +1,758 @@
+===  附件1-1： 基于横摆角速度状态的滑模控制核心代码(开始) ========
+function Mz = smc_controller(x, VehiclePara)
+====================== 1. 参数提取 ==========================
+lf = single(VehiclePara.lf);
+lr = single(VehiclePara.lr);
+Iz = single(VehiclePara.Iz);
+beta      = single(x(1));
+omega     = single(x(2));
+delta     = single(x(3));
+vx_raw    = single(x(4));
+beta_ref  = single(x(5));
+omega_ref = single(x(6));
+Cf = single(x(7));
+Cr = single(x(8));
+if vx_raw < single(0.5)
+    vx = single(0.5); 
+else
+    vx = vx_raw;
+end
+====================== 2. 状态误差计算 ======================
+e_omega = omega - omega_ref;
+====================== 3. 滑模面设计 ========================
+lambda = single(2.0); 
+alpha_f = delta - (beta + lf * omega / vx);
+alpha_r = -(beta - lr * omega / vx);
+
+Fyf = Cf * alpha_f;
+Fyr = Cr * alpha_r;
+omega_dot_nominal = (lf * Fyf - lr * Fyr) / Iz;
+omega_ref_dot = single(x(9));
+s = (omega_dot_nominal - omega_ref_dot) + lambda * e_omega;
+===================== 4. 控制律设计=========================
+k_gain = single(3000.0); 
+boundary = single(0.05);  
+Mz_eq = -Iz * (omega_dot_nominal - omega_ref_dot + lambda * e_omega);
+s_sat = sat(s, boundary); 
+Mz_sw = -k_gain * s_sat;
+Mz = Mz_eq + Mz_sw;
+===================== 5. 输出限幅与保护 ====================
+Mz_max = single(5000.0); 
+Mz_min = single(-5000.0);
+if Mz > Mz_max
+    Mz = Mz_max;
+elseif Mz < Mz_min
+    Mz = Mz_min;
+end
+end
+================== 辅助函数：饱和函数 =====================
+function y = sat(s, boundary)
+    s_single = s;
+    boundary_single = boundary;
+    if boundary_single <= single(0)
+        y = sign(s_single);
+        return;
+    end
+    abs_s = abs(s_single);
+    if abs_s <= boundary_single
+        y = s_single / boundary_single;
+    else
+        y = sign(s_single);
+    end
+end
+====  附件1-1： 基于横摆角速度状态的滑模控制核心代码(结束) ======
+====  附件1-2： 模型预测控制核心代码(开始) ====================
+function delta_u = mpc_s32k(x, VehiclePara)
+====================== 1. 参数设置==========================
+Np = 10; 
+Nc = 10; 
+nx = 2; 
+nu = 1; 
+====================== 2. 状态提取 =========================
+beta       = single(x(1));
+omega      = single(x(2));
+delta      = single(x(3)); 
+u          = single(x(4)); 
+beta_ref   = single(x(5));
+omega_ref  = single(x(6));
+T          = single(x(7)); 
+u_k_1      = single(x(8));
+MPC_mode   = single(x(9)); 
+MPC_Ibeta  = single(x(10));
+MPC_Iwz    = single(x(11));
+Cf_raw     = single(x(12));
+Cr_raw     = single(x(13));
+====================== 3.提取整车参数 ======================
+m  = single(VehiclePara.m);
+lf = single(VehiclePara.lf);
+lr = single(VehiclePara.lr);
+Iz = single(VehiclePara.Iz);
+====================== 4. x中获取参数========================
+Cf_min = single(10000.0);
+Cf_max = single(100000.0);
+Cr_min = single(10000.0);
+Cr_max = single(100000.0);
+
+Cf = max(Cf_min, min(Cf_max, Cf_raw));
+Cr = max(Cr_min, min(Cr_max, Cr_raw));
+if Cf <= single(0) || Cr <= single(0)
+    warning('Estimated tire stiffness is non-positive, using default values.');
+    Cf = single(60000.0); 
+    Cr = single(60000.0); 
+end
+=============== 5. 构建连续系统状态空间模型 ==================
+if abs(u) < single(1.0)
+    u_safe = sign(u) * single(1.0);
+else
+    u_safe = u;
+end
+a11 = -(Cf + Cr)/(m * u_safe);
+a12 = (Cf*lf - Cr*lr)/(m * u_safe^2) - single(1.0);
+a21 = (Cf*lf - Cr*lr)/Iz;
+a22 = -(lf^2*Cf + lr^2*Cr)/(Iz * u_safe);
+b11 = single(0.0); 
+b21 = single(1.0)/Iz; 
+bd11 = Cf/(m*u_safe); 
+bd21 = lf*Cf/Iz; 
+A_cont = [a11, a12;
+          a21, a22];
+B_cont = [b11;
+          b21];
+Bd_cont = [bd11;
+           bd21];
+====================== 6. 离散化处理 =========================
+A_disc = eye(nx, 'like', A_cont) + T * A_cont;
+B_disc = T * B_cont;
+Bd_disc = T * Bd_cont;
+====================== 7. 增广状态空间模型 ===================
+ksi_current = [beta; omega; u_k_1];
+A_aug = [A_disc, B_disc;
+         zeros(1,nx,'like',A_cont), single(1.0)];
+B_aug = [B_disc;
+         single(1.0)];
+C_aug = [eye(nx,'like',A_cont), zeros(nx,1,'like',A_cont)];
+Bd_aug = [Bd_disc; single(0.0)]; 
+====================== 8. 构造预测矩阵 ======================
+Sc = zeros(Np*nx, nx+1, 'like', A_cont); 
+for i = 1:Np
+    Sc((nx*(i-1)+1):(nx*i), :) = C_aug * (mpower(A_aug, i));
+end
+Sd = zeros(Np*nx, 1, 'like', A_cont);
+tmp = zeros(nx,1,'like',A_cont);
+for i = 1:Np
+    tmp = tmp + C_aug * (mpower(A_aug,i-1)) * Bd_aug;
+    Sd((nx*(i-1)+1):(nx*i)) = tmp;
+end
+Su = zeros(Np*nx, Nc, 'like', A_cont);
+for i = 1:Np
+    for j = 1:Nc
+        if j <= i
+            Su((nx*(i-1)+1):(nx*i), j) = C_aug * (mpower(A_aug,i-j)) * B_aug;
+        else
+            Su((nx*(i-1)+1):(nx*i), j) = zeros(nx,1,'like',A_cont);
+        end
+    end
+end
+============= 9. 权重矩阵 Q 与 R 设计 =======================
+if MPC_mode == single(1.0)
+    qk1 = single(15.0);
+    qk2 = single(15.0);
+else
+    qk1 = MPC_Ibeta;
+    qk2 = MPC_Iwz;
+end
+Qi = diag([qk1, qk2]);
+Q_full = kron(eye(Np, 'like', A_cont), Qi); 
+R_weight = single(0.0003);
+R_full = R_weight * eye(Nc, 'like', A_cont);
+============ 10. 参考轨迹生成 ==============================
+Ref = zeros(Np*nx, 1, 'like', A_cont);
+Ri = [beta_ref; omega_ref];
+for i = 1:Np
+    Ref((nx*(i-1)+1):(nx*i)) = Ri;
+end
+============= 11. 构造偏差项 ===============================
+pred_by_state_and_disturbance = Sc * ksi_current + Sd * delta; % x(3) is current delta
+E = pred_by_state_and_disturbance - Ref;
+=========== 12. 构造 Hessian (H) 和梯度 (G) 矩阵 =================
+H_mat = Su' * Q_full * Su + R_full;
+G_vec = (Su' * Q_full * E)'; 
+
+=============== 13. 求解QP问题 =============================
+try
+    delta_u_seq_unconstrained = -H_mat \ G_vec;
+catch ME
+    delta_u_seq_unconstrained = zeros(Nc, 1, 'like', A_cont);
+end
+u_min_val = single(-5000.0);
+u_max_val = single(5000.0);
+delta_u_seq = max(u_min_val, min(u_max_val, delta_u_seq_unconstrained));
+============== 14. 输出第一个控制增量 ========================
+delta_u = delta_u_seq(1);
+if delta_u < u_min_val
+    delta_u = u_min_val;
+elseif delta_u > u_max_val
+    delta_u = u_max_val;
+end
+end
+======================= 辅助函数===========================
+function Y = mpower(X, n)
+n_int = int32(n);
+if n_int <= 0
+    Y = eye(size(X,1),'like',X);
+    return;
+end
+Y = X;
+for i = 2:n_int
+    Y = X * Y;
+end
+end
+===========  附件1-2： 模型预测控制核心代码(结束) ===============
+附件2：
+===========  附件2-1： 变步长模型预测控制核心代码(开始) ==========
+function [Ctrl_SteerSW, t_Elapsed, DebugInfo] = mpc_variable_step_controller(u, VehiclePara, MPCParameters, Constraints, X_ref_input)
+    t_Start = single(0);
+    Calpha_f = single(u(35));
+    Calpha_r = single(u(36));
+    Vel_raw  = single(u(4)) / single(3.6); 
+    if Vel_raw < single(1.0)
+        Vel = single(1.0);
+    else
+        Vel = Vel_raw;
+    end
+    Vy       = single(u(5)) / single(3.6);
+    yawrate  = single(u(6)) * single(pi/180);
+    Rollrate = single(u(32)) * single(pi/180);
+    Roll     = single(u(31)) * single(pi/180);
+    fwa      = single(u(8)) * single(pi/180); 
+    e_y      = single(u(40));
+    e_psi    = single(u(41));
+    Xm = [Vy; yawrate; Rollrate; Roll; e_y; e_psi];
+    Nx = length(Xm); 
+    ============== 1. 构建变步长离散模型 =======================
+    Model = func_RigidbodyModel_FOH_Matrix_ROLL(VehiclePara, MPCParameters, Vel, Calpha_f, Calpha_r);
+    As = Model.As;     
+    Bs = Model.Bs_tot;  
+    Al = Model.Al;    
+    Bl = Model.Bl_tot;
+    Nu = size(Bs, 2); 
+    Np = MPCParameters.Np;
+    Ns = MPCParameters.Ns;     
+    ============= 2. 构建变步长预测矩阵 =======================
+    Sc = zeros(Np*Nx, Nx, 'like', Xm);
+    Su = zeros(Np*Nx, Np*Nu, 'like', Xm);
+    A_curr = eye(Nx, 'like', Xm);
+    for i = 1:Np
+        if i <= Ns
+            A_step = As;
+        else
+            A_step = Al;
+        end
+        A_curr = A_step * A_curr;
+        Sc((i-1)*Nx+1:i*Nx, :) = A_curr;
+        for j = 1:i
+            if j <= Ns
+                B_step_src = Bs;
+            else
+                B_step_src = Bl;
+            end     
+            if i == j
+                B_col = B_step_src;
+            else
+                B_col = A_step * B_col;
+            end
+            col_start = (j-1)*Nu + 1;
+            col_end = j*Nu;
+            Su((i-1)*Nx+1:i*Nx, col_start:col_end) = B_col;
+        end
+    end
+    ====================== 3. 构建 (H, G) ======================
+    Wey     = single(MPCParameters.Wey);
+    Wephi   = single(MPCParameters.Wephi);
+    R_weight = single(MPCParameters.R_weight);
+    sqrt_Q = zeros(Np*Nx, 1, 'like', Xm);
+    for k = 0:Np-1
+        idx_base = k*Nx;
+        sqrt_Q(idx_base+5) = sqrt(Wey);
+        sqrt_Q(idx_base+6) = sqrt(Wephi);
+    end
+    X_ref = single(X_ref_input);
+    Su_w = zeros(size(Su), 'like', Xm);
+    Err_free = Sc * Xm - X_ref;
+    Err_w = zeros(size(Err_free), 'like', Xm);
+    for row = 1:(Np*Nx)
+        w = sqrt_Q(row);
+        if w > single(0)
+            for col = 1:(Np*Nu)
+                Su_w(row, col) = Su(row, col) * w;
+            end
+            Err_w(row) = Err_free(row) * w;
+        end
+    end
+    H_mat = single(2.0) * (Su_w' * Su_w) + single(2.0) * R_weight * eye(Np*Nu, 'like', Xm);
+    G_vec = single(2.0) * (Su_w' * Err_w);
+    ====================== 4. QP 求解  =======================
+    delta_u_seq = zeros(Np*Nu, 1, 'like', Xm);
+    alpha = single(MPCParameters.SolverAlpha);
+    max_iter = MPCParameters.MaxIter;
+    umax = single(Constraints.umax);
+    dumax_rate = single(Constraints.dumax_rate);
+    dumax = dumax_rate * MPCParameters.Ts;
+    u_min = -umax; u_max = umax;
+    du_min = -dumax; du_max = dumax;
+    prev_u_base = fwa; 
+    
+    for iter = 1:max_iter
+        grad = H_mat * delta_u_seq + G_vec;
+        delta_u_candidate = delta_u_seq - alpha * grad;
+        current_u = prev_u_base;
+        for j = 1:(Np*Nu)
+            du = delta_u_candidate(j);
+            if du < du_min, du = du_min; end
+            if du > du_max, du = du_max; end
+            next_u = current_u + du;
+            if next_u < u_min
+                du = u_min - current_u;
+            elseif next_u > u_max
+                du = u_max - current_u;
+            end
+            if du < du_min, du = du_min; end
+            if du > du_max, du = du_max; end       
+            delta_u_candidate(j) = du;
+            current_u = current_u + du;
+        end
+        delta_u_seq = delta_u_candidate;
+    end
+    fwa_opt = fwa + delta_u_seq(1);
+    ==================== 5. 输出处理 =========================
+    if fwa_opt > u_max, fwa_opt = u_max; end
+    if fwa_opt < u_min, fwa_opt = u_min; end
+    Ctrl_SteerSW = single(25) * fwa_opt * single(180/pi);
+    t_Elapsed = single(0); 
+    DebugInfo.Vel = Vel;
+    DebugInfo.Iterations = max_iter;
+    DebugInfo.ModelType = 'VariableStep_PadeAugmented_v2_Corrected_IndependentXref';
+end
+===================== 辅助函数1 ============================
+function [StateSpaceModel] = func_RigidbodyModel_FOH_Matrix_ROLL(VehiclePara, MPCParameters, Vel, Calpha_f, Calpha_r)
+    M       = single(VehiclePara.M);
+    Iz      = single(VehiclePara.Iz);
+    Ix      = single(VehiclePara.Ix);
+    hCG     = single(VehiclePara.hCG);
+    lf      = single(VehiclePara.lf);
+    lr      = single(VehiclePara.lr);
+    g       = single(9.81);
+    K_phi   = single(VehiclePara.K_phi); 
+    D_phi   = single(VehiclePara.D_phi); 
+    Theta_1 = Calpha_f + Calpha_r;
+    Theta_2 = Calpha_f * lf - Calpha_r * lr;
+    Theta_3 = Calpha_f * lf^2 + Calpha_r * lr^2;
+    Vel_safe = max(Vel, single(1.0));
+    Mint = [ M,       0,       -M*hCG,        0;
+           0,        Iz,       0,             0;
+           -M*hCG,  0,       Ix+M*hCG^2,   0;
+           0,        0,       0,             1 ];
+    Nint = [ -Theta_1/Vel_safe,    M*Vel_safe - Theta_2/Vel_safe,   0,           single(0); 
+             -Theta_2/Vel_safe,    -Theta_3/Vel_safe,            0,           single(0);
+             0,                    -M*hCG*Vel_safe,                 D_phi,       K_phi - M*g*hCG;
+             0,                    0,                       -1,          single(0) ];
+    F1int = [-Calpha_f; -lf*Calpha_f; 0; 0]; 
+    Ac_11 = -inv(Mint) * Nint; 
+    B1cn_11 = inv(Mint) * F1int; 
+    Nx_total = 6;
+    Ac_12 = zeros(4, 2);
+    Ac_21 = [1, 0, 0, 0; 0, 1, 0, 0]; 
+    Ac_22 = [0, Vel_safe; 0, 0];
+    B1cn_12 = [0; 0];
+    Acn = [Ac_11, Ac_12; Ac_21, Ac_22];
+    B1cn = [B1cn_11; B1cn_12];
+    Ts  = single(MPCParameters.Ts);
+    Tsl = single(MPCParameters.Tsl);
+    Nx  = size(Acn, 1); 
+    Nu  = size(B1cn, 2); 
+    As = eye(Nx) + Ts * Acn;
+    Bs_tot = Ts * B1cn; 
+    M_aug = [Acn * Tsl, B1cn * Tsl; 
+             zeros(Nu, Nx + Nu)]; 
+    M_exp = func_matrix_exponential_pade(M_aug, 2);
+    Al = M_exp(1:Nx, 1:Nx);
+    Bl_tot = M_exp(1:Nx, Nx+1:Nx+Nu); 
+    StateSpaceModel.Acn     = Acn;
+    StateSpaceModel.B1cn    = B1cn;
+    StateSpaceModel.As      = As;
+    StateSpaceModel.Bs_tot  = Bs_tot;
+    StateSpaceModel.Al      = Al;
+    StateSpaceModel.Bl_tot  = Bl_tot;
+end
+======================== 辅助函数2 =========================
+function Y = func_matrix_exponential_pade(A, order)
+    %#codegen
+    [n, ~] = size(A);
+    I_n = eye(n, 'like', A);
+    
+    if order == 2
+        A2 = A * A;
+        c2 = single(1.0/12.0);
+        c1 = single(0.5);
+        Num = I_n + A * c1 + A2 * c2;
+        Den = I_n - A * c1 + A2 * c2;
+        Y = inv(Den) * Num; 
+    else
+        Y = I_n + A;
+    end
+end
+========== 附件2-1： 变步长模型预测控制核心代码(结束) =============
+附件3：
+========== 附件3-1： 轨迹重规划核心代码(开始) ===================
+function [sys, x0, str, ts] = planTrajectory11(t, x, u, flag)
+switch flag
+    case 0
+        [sys, x0, str, ts] = mdlInitializeSizes;  
+    case 2
+        sys = mdlUpdate(t, x, u);   
+    case 3
+        sys = mdlOutputs(t, x, u);   
+    case {1,4,9}
+        sys = [];  
+    otherwise
+        error(['flag = ', num2str(flag)]);
+end
+end  
+=================== 1.初始化模块参数 ==========================
+function [sys, x0, str, ts] = mdlInitializeSizes
+sizes = simsizes;
+sizes.NumContStates  = 0; 
+sizes.NumDiscStates  = 5; 
+sizes.NumOutputs     = 10; 
+sizes.NumInputs      = 12; 
+sizes.DirFeedthrough = 1; 
+sizes.NumSampleTimes = 1; 
+sys = simsizes(sizes);
+x0  = [0.001; 0.0001; 0.0001; 0.00001; 0.00001]; 
+str = [];
+ts  = [0.01 0]; 
+end
+==================== 2.更新离散状态 ===========================
+function sys = mdlUpdate(t, x, u)
+sys = x; 
+end
+===================== 3.核心轨迹规划逻辑 ======================
+function sys = mdlOutputs(t, x, u)
+Nx = 5; 
+Np = 10; 
+Nc = 2; 
+Nobs = 6; 
+T = 0.01;
+g = 9.81;
+mu = 0.8; 
+Q = 200 * eye(Np); 
+R = 20 * eye(Nc); 
+S = 500; 
+y_dot_in = u(1)/3.6; 
+x_dot_in = u(2)/3.6 + 1e-4;
+delta_in = u(3) * pi/180; 
+psi_in   = u(4) * pi/180; 
+Y_in     = u(5); 
+X_in     = u(6);
+C_alpha_f = u(7); 
+C_alpha_r = u(8); 
+m = u(9);  
+Iz = u(10); 
+lf = u(11); 
+lr = u(12); 
+State_Initial = [y_dot_in; x_dot_in; psi_in; Y_in; X_in];
+====================== 4.参考轨迹生成 ========================
+shape = 2.4;
+dx1 = 25;   dx2 = 21.95;
+dy1 = 4.05; dy2 = 5.7;
+Xs1 = 27.19; Xs2 = 56.46;
+X_phi = 1:1:220;
+z1 = shape/dx1 * (X_phi - Xs1) - shape/2;
+z2 = shape/dx2 * (X_phi - Xs2) - shape/2;
+Y_ref_global = dy1/2 * (1 + tanh(z1)) - dy2/2 * (1 + tanh(z2));
+idx_start = round(X_in) + 1;
+idx_end   = idx_start + Np - 1;
+if idx_end > length(Y_ref_global)
+    idx_end = length(Y_ref_global);
+end
+Yref_local = Y_ref_global(idx_start:idx_end)';
+if length(Yref_local) < Np
+    Yref_local = [Yref_local; repmat(Yref_local(end), Np - length(Yref_local), 1)];
+end
+===================== 5.障碍物位置设置 =======================
+X_obstacle = [25; 25; 30; 30; 27.5; 27.5];
+Y_obstacle = [0.2; 1.0; 0.2; 1.0; 0.2; 1.0]; 
+===================== 6.求解最优控制序列 =====================
+u_init = [0; 0]; % Initial guess
+lb = [-pi/6; -pi/6]; 
+ub = [ pi/6;  pi/6]; 
+alpha = 0.001; 
+max_iter = 100; 
+tol = 1e-6; 
+u_vec = u_init;
+for iter = 1:max_iter
+    [J_val, grad_J] = costFunctionAndGradient(u_vec, State_Initial, delta_in, Np, Nc, T, ...
+        Yref_local, Q, R, S, X_obstacle, Y_obstacle, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+    u_vec_new = u_vec - alpha * grad_J;
+    u_vec_new = max(lb, min(ub, u_vec_new));
+    u_vec = u_vec_new;
+end
+u_opt = u_vec;
+================= 7.基于最优控制进行状态预测 ==================
+delta_seq = zeros(Np, 1);
+for i = 1:Np
+    if i <= Nc
+        delta_seq(i) = delta_in + u_opt(i);
+    else
+        delta_seq(i) = delta_in + u_opt(end);
+    end
+end
+[vx_pred, vy_pred, psi_pred, Y_pred, X_pred] = predictTrajectory(delta_seq, State_Initial, Np, T, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+================= 8.轨迹拟合输出 ============================
+valid_idx = find(X_pred >= min(X_phi) & X_pred <= max(X_phi));
+if length(valid_idx) < 5
+    warning('Not enough valid points for polynomial fitting.');
+    poly_coef_Y = [0, 0, 0, 0, Y_in];
+    poly_coef_phi = [0, 0, 0, 0, psi_in];
+else
+    if length(valid_idx) >= 5
+        poly_coef_Y   = polyfit(X_pred(valid_idx), Y_pred(valid_idx), 4);
+        poly_coef_phi = polyfit(X_pred(valid_idx), psi_pred(valid_idx), 4);
+    else
+        poly_coef_Y = [0, 0, 0, 0, Y_in];
+        poly_coef_phi = [0, 0, 0, 0, psi_in];
+    end
+end
+OutPut = [poly_coef_Y.'; poly_coef_phi.']; 
+sys = OutPut;
+end
+============== 9.定义轨迹优化的目标函数及其梯度 ===============
+function [J, grad_J] = costFunctionAndGradient(u_vec, State_Initial, delta_in, Np, Nc, T, Yref, Q, R, S, X_obs, Y_obs, C_alpha_f, C_alpha_r, m, Iz, lf, lr)
+    delta_seq = zeros(Np, 1);
+    for i = 1:Np
+        if i <= Nc
+            delta_seq(i) = delta_in + u_vec(i);
+        else
+            delta_seq(i) = delta_in + u_vec(end);
+        end
+    end
+    [vx_pred, vy_pred, psi_pred, Y_pred, X_pred] = predictTrajectory(delta_seq, State_Initial, Np, T, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+    Y_error = Y_pred - Yref;
+    if length(Y_error) < Np
+        Y_error_padded = [Y_error; zeros(Np - length(Y_error), 1)];
+    else
+        Y_error_padded = Y_error(1:Np);
+    end
+    tracking_cost = Y_error_padded' * Q * Y_error_padded;
+    control_cost  = u_vec(1:Nc)' * R * u_vec(1:Nc);
+    J_obs_sum = 0;
+    for k = 1:Np
+        current_pos = [X_pred(k); Y_pred(k)];
+        min_dist_sq = inf;
+        for j = 1:length(X_obs)
+            obs_center_x = X_obs(j);
+            obs_center_y = Y_obs(j);
+            dist_sq = (current_pos(1) - obs_center_x)^2 + (current_pos(2) - obs_center_y)^2;
+            min_dist_sq = min(min_dist_sq, dist_sq);
+        end
+        safe_dist = 5.0; 
+        sigma = 2.0; 
+        if min_dist_sq < safe_dist^2
+            penalty_factor = exp(-min_dist_sq / (sigma^2 + 1e-6)); 
+            J_obs_sum = J_obs_sum + penalty_factor;
+        end
+    end
+    obstacle_cost = S * J_obs_sum;
+    J = tracking_cost + control_cost + obstacle_cost;
+    n_u = length(u_vec);
+    grad_J = zeros(n_u, 1);
+    eps_grad = 1e-6; 
+    for i = 1:n_u
+        u_plus = u_vec; u_minus = u_vec;
+        u_plus(i) = u_plus(i) + eps_grad;
+        u_minus(i) = u_minus(i) - eps_grad;
+        delta_seq_plus = zeros(Np, 1);
+        for k = 1:Np
+            if k <= Nc
+                delta_seq_plus(k) = delta_in + u_plus(k);
+            else
+                delta_seq_plus(k) = delta_in + u_plus(end);
+            end
+        end
+        [~, _, psi_plus, Y_plus, X_plus] = predictTrajectory(delta_seq_plus, State_Initial, Np, T, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+        Y_error_plus = Y_plus - Yref;
+        if length(Y_error_plus) < Np
+            Y_error_padded_plus = [Y_error_plus; zeros(Np - length(Y_error_plus), 1)];
+        else
+            Y_error_padded_plus = Y_error_plus(1:Np);
+        end
+        J_plus = Y_error_padded_plus' * Q * Y_error_padded_plus + ...
+                 u_plus(1:Nc)' * R * u_plus(1:Nc);
+        J_obs_sum_plus = 0;
+        for k = 1:Np
+            current_pos_plus = [X_plus(k); Y_plus(k)];
+            min_dist_sq_plus = inf;
+            for j = 1:length(X_obs)
+                obs_center_x = X_obs(j);
+                obs_center_y = Y_obs(j);
+                dist_sq_plus = (current_pos_plus(1) - obs_center_x)^2 + (current_pos_plus(2) - obs_center_y)^2;
+                min_dist_sq_plus = min(min_dist_sq_plus, dist_sq_plus);
+            end
+            if min_dist_sq_plus < safe_dist^2
+                penalty_factor_plus = exp(-min_dist_sq_plus / (sigma^2 + 1e-6)); 
+                J_obs_sum_plus = J_obs_sum_plus + penalty_factor_plus;
+            end
+        end
+        J_plus = J_plus + S * J_obs_sum_plus;
+        delta_seq_minus = zeros(Np, 1);
+        for k = 1:Np
+            if k <= Nc
+                delta_seq_minus(k) = delta_in + u_minus(k);
+            else
+                delta_seq_minus(k) = delta_in + u_minus(end);
+            end
+        end
+        [~, _, psi_minus, Y_minus, X_minus] = predictTrajectory(delta_seq_minus, State_Initial, Np, T, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+        Y_error_minus = Y_minus - Yref;
+        if length(Y_error_minus) < Np
+            Y_error_padded_minus = [Y_error_minus; zeros(Np - length(Y_error_minus), 1)];
+        else
+            Y_error_padded_minus = Y_error_minus(1:Np);
+        end
+        J_minus = Y_error_padded_minus' * Q * Y_error_padded_minus + ...
+                  u_minus(1:Nc)' * R * u_minus(1:Nc);
+        J_obs_sum_minus = 0;
+        for k = 1:Np
+            current_pos_minus = [X_minus(k); Y_minus(k)];
+            min_dist_sq_minus = inf;
+            for j = 1:length(X_obs)
+                obs_center_x = X_obs(j);
+                obs_center_y = Y_obs(j);
+                dist_sq_minus = (current_pos_minus(1) - obs_center_x)^2 + (current_pos_minus(2) - obs_center_y)^2;
+                min_dist_sq_minus = min(min_dist_sq_minus, dist_sq_minus);
+            end
+            if min_dist_sq_minus < safe_dist^2
+                penalty_factor_minus = exp(-min_dist_sq_minus / (sigma^2 + 1e-6)); 
+                J_obs_sum_minus = J_obs_sum_minus + penalty_factor_minus;
+            end
+        end
+        J_minus = J_minus + S * J_obs_sum_minus;
+        grad_J(i) = (J_plus - J_minus) / (2 * eps_grad);
+    end
+end
+===================== 10.模型预测函数 =========================
+function [vx_pred, vy_pred, psi_pred, Y_pred, X_pred] = predictTrajectory(delta_seq, State_Initial, Np, T, C_alpha_f, C_alpha_r, m, Iz, lf, lr)
+vy0 = State_Initial(1);
+vx0 = State_Initial(2);
+psi0 = State_Initial(3);
+Y0 = State_Initial(4);
+X0 = State_Initial(5);
+if C_alpha_f <= 0 || C_alpha_r <= 0 || m <= 0 || Iz <= 0 || lf <= 0 || lr <= 0
+    error('Parameters C_alpha_f, C_alpha_r, m, Iz, lf, lr must be positive values.');
+end
+vx_pred = zeros(Np, 1);
+vy_pred = zeros(Np, 1);
+psi_pred = zeros(Np, 1);
+Y_pred = zeros(Np, 1);
+X_pred = zeros(Np, 1);
+vy_current = vy0;
+psi_dot_current = 0; 
+psi_current = psi0;
+Y_current = Y0;
+X_current = X0;
+for k = 1:Np
+    vx_pred(k) = vx0; 
+    state_current = [vy_current; psi_dot_current];
+    psi_current_state = psi_current;
+    input_delta = delta_seq(k);
+    d_state_k1 = dynamics(state_current, input_delta, vx0, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+    d_psi_k1 = state_current(2); 
+    d_Y_k1 = vx0 * sin(psi_current_state) + vy_current * cos(psi_current_state);
+    d_X_k1 = vx0 * cos(psi_current_state) - vy_current * sin(psi_current_state);
+    state_k2 = state_current + (T/2) * d_state_k1;
+    psi_k2 = psi_current + (T/2) * d_psi_k1;
+    Y_k2 = Y_current + (T/2) * d_Y_k1;
+    X_k2 = X_current + (T/2) * d_X_k1;
+    d_state_k2 = dynamics(state_k2, input_delta, vx0, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+    d_psi_k2 = state_k2(2);
+    d_Y_k2 = vx0 * sin(psi_k2) + state_k2(1) * cos(psi_k2);
+    d_X_k2 = vx0 * cos(psi_k2) - state_k2(1) * sin(psi_k2);
+    state_k3 = state_current + (T/2) * d_state_k2;
+    psi_k3 = psi_current + (T/2) * d_psi_k2;
+    Y_k3 = Y_current + (T/2) * d_Y_k2;
+    X_k3 = X_current + (T/2) * d_X_k2;
+    d_state_k3 = dynamics(state_k3, input_delta, vx0, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+    d_psi_k3 = state_k3(2);
+    d_Y_k3 = vx0 * sin(psi_k3) + state_k3(1) * cos(psi_k3);
+    d_X_k3 = vx0 * cos(psi_k3) - state_k3(1) * sin(psi_k3);
+    state_k4 = state_current + T * d_state_k3;
+    psi_k4 = psi_current + T * d_psi_k3;
+    Y_k4 = Y_current + T * d_Y_k3;
+    X_k4 = X_current + T * d_X_k3;
+    d_state_k4 = dynamics(state_k4, input_delta, vx0, C_alpha_f, C_alpha_r, m, Iz, lf, lr);
+    d_psi_k4 = state_k4(2);
+    d_Y_k4 = vx0 * sin(psi_k4) + state_k4(1) * cos(psi_k4);
+    d_X_k4 = vx0 * cos(psi_k4) - state_k4(1) * sin(psi_k4);
+    state_next = state_current + (T/6) * (d_state_k1 + 2*d_state_k2 + 2*d_state_k3 + d_state_k4);
+    psi_next = psi_current + (T/6) * (d_psi_k1 + 2*d_psi_k2 + 2*d_psi_k3 + d_psi_k4);
+    Y_next = Y_current + (T/6) * (d_Y_k1 + 2*d_Y_k2 + 2*d_Y_k3 + d_Y_k4);
+    X_next = X_current + (T/6) * (d_X_k1 + 2*d_X_k2 + 2*d_X_k3 + d_X_k4);
+    vy_current = state_next(1);
+    psi_dot_current = state_next(2);
+    psi_current = psi_next;
+    Y_current = Y_next;
+    X_current = X_next;
+    vy_pred(k) = vy_current;
+    psi_pred(k) = psi_current;
+    Y_pred(k) = Y_current;
+    X_pred(k) = X_current;
+end
+end
+function d_state_dt = dynamics(state, input_delta, vx, C_alpha_f, C_alpha_r, m, Iz, lf, lr)
+    vy = state(1);
+    psi_dot = state(2);
+    A11 = -(C_alpha_f + C_alpha_r) / (m * vx);
+    A12 = (C_alpha_r * lr - C_alpha_f * lf) / (m * vx) - vx;
+    A21 = (C_alpha_r * lr - C_alpha_f * lf) / (Iz * vx);
+    A22 = -(C_alpha_r * lr^2 + C_alpha_f * lf^2) / (Iz * vx);
+    B11 = C_alpha_f / m;
+    B21 = C_alpha_f * lf / Iz;
+    A = [A11, A12; A21, A22];
+    B = [B11; B21];
+    d_state_dt = A * state + B * input_delta;
+end
+================ 附件3-1： 轨迹重规划核心代码(结束) ============
+========== 附件3-2：DYC与AFS协调策略核心代码(开始)===========
+function [region, dyc_gain, afs_gain] = fcn( beta_max, r_max, beta, r, ay, v_x, mu,C_n)
+g = 9.81; 
+region = 3;dyc_gain = 1.0;afs_gain = 0.0;
+upper_bound = 0.67 * g * mu;
+correction = 1 / (1 + 0.0025 * (v_x - 100)^2); 
+if C_n > 0.8
+	region = 3; dyc_gain = 1.0; afs_gain = 0.0;
+else
+if abs(beta) <= beta_max && abs(r) <= r_max
+    lower_bound = (0.22 - 0.002 * v_x) * g;
+    if ay < lower_bound
+        region = 1;
+        dyc_gain = 0.0;
+        afs_gain = 1.0;      
+    elseif ay >= lower_bound && ay <= upper_bound
+        region = 2;        
+        x = 20 * (ay - upper_bound + correction);
+        dyc_gain = atan(x) / pi + max(0.625*abs(C_n),0.32);
+        dyc_gain = max(0.0, min(1.0, dyc_gain)); 
+        afs_gain = 1.0 - dyc_gain;
+     else
+        region = 3;
+        dyc_gain = 1.0;
+        afs_gain = 0.0;
+    end
+else
+    region = 3;
+    dyc_gain = 1.0;
+    afs_gain = 0.0;
+end
+end
+end
+========== 附件3-2： DYC 与 AFS 协调策略核心代码(结束)========
